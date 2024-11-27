@@ -12,7 +12,8 @@ import (
 
 // Value is a way of having structured data with no specific schema. It mirrors
 // JSON's limited type set. So, Value can only be one of the following:
-// [Struct], [Array], [Number], [String], [Bool], or [Null].
+// [Struct], [Array], [Number], [String], [Bool]. JSON "null" can be represented
+// by Go's nil.
 type Value interface {
 	xIsValue()
 	String() string
@@ -51,7 +52,7 @@ func fastFromValue(v any) Value {
 	case string:
 		return String(rv)
 	case nil:
-		return Null{}
+		return nil
 	}
 	panic(fmt.Sprintf("fastFromValue: unexpected type %T", v))
 }
@@ -128,37 +129,47 @@ func (f fromValueWrappedError) Error() string {
 	return fmt.Sprintf("cannot convert value at %s: %s", strings.Join(f.path, ""), f.error.Error())
 }
 
-func fromReflectValue(anyv any, path []string) (Value, error) {
-	switch sv := anyv.(type) {
-	case interface{ SimpleValue() Value }:
-		return sv.SimpleValue(), nil
-	case interface{ SimpleValue() (Value, error) }:
-		v, err := sv.SimpleValue()
-		if err != nil {
-			return nil, fromValueWrappedError{
-				error: err,
-				path:  path,
+func fromReflectValue(rv reflect.Value, path []string) (Value, error) {
+	if !rv.IsValid() {
+		return nil, nil
+	}
+	if rv.CanInterface() {
+		switch sv := rv.Interface().(type) {
+		case interface{ SimpleValue() Value }:
+			return sv.SimpleValue(), nil
+		case interface{ SimpleValue() (Value, error) }:
+			v, err := sv.SimpleValue()
+			if err != nil {
+				return nil, fromValueWrappedError{
+					error: err,
+					path:  path,
+				}
 			}
+			return v, nil
 		}
-		return v, nil
+		// unpack underlying values
+		rv = reflect.ValueOf(rv.Interface())
 	}
 
 	if len(path) >= 1000 {
-		panic("fromReflectValue: value too deep")
+		panic(fmt.Sprintf("fromReflectValue: value too deep, path: %v", path))
 	}
-	rv := reflect.ValueOf(anyv)
+
 	rt := rv.Type()
-	switch rt.Kind() {
+	switch rv.Kind() {
 
 	// composite types
 	case reflect.Pointer:
 		if rv.IsNil() {
-			return Null{}, nil
+			return nil, nil
 		}
 		return fromReflectValue(rv.Elem(), path)
 	case reflect.Struct:
 		outstruct := make(Struct, rt.NumField())
 		for i := 0; i < rv.NumField(); i++ {
+			if !rt.Field(i).IsExported() {
+				continue
+			}
 			key := rt.Field(i).Name
 			value, err := fromReflectValue(rv.Field(i), append(path, ".", key))
 			if err != nil {
@@ -170,7 +181,7 @@ func fromReflectValue(anyv any, path []string) (Value, error) {
 	case reflect.Map:
 		keytostr := stringify(rt.Key())
 		if keytostr == nil {
-			return nil, fromValueError{path: path, problem: fmt.Sprintf("map key with type %q cannot be stringified", rt.Key().String())}
+			return nil, fromValueError{path: path, problem: fmt.Sprintf("map key with %s type %q cannot be stringified", rt.Key().Kind(), rt.Key().String())}
 		}
 		outstruct := make(Struct, rv.Len())
 		mapiter := rv.MapRange()
@@ -242,6 +253,23 @@ type Struct map[string]Value
 
 func (Struct) xIsValue() {}
 
+func (s *Struct) UnmarshalJSON(data []byte) error {
+	var intermediate map[string]json.RawMessage
+	err := json.Unmarshal(data, &intermediate)
+	if err != nil {
+		return err
+	}
+	newstruct := make(Struct, len(intermediate))
+	for k, jd := range intermediate {
+		newstruct[k], err = FromJSON(jd)
+		if err != nil {
+			return err
+		}
+	}
+	*s = newstruct
+	return nil
+}
+
 // String implements [Value]
 func (s Struct) String() string {
 	return mustJSONEncodeValue(s)
@@ -251,6 +279,23 @@ func (s Struct) String() string {
 type Array []Value
 
 func (Array) xIsValue() {}
+
+func (a *Array) UnmarshalJSON(data []byte) error {
+	var intermediate []json.RawMessage
+	err := json.Unmarshal(data, &intermediate)
+	if err != nil {
+		return err
+	}
+	newarray := make(Array, len(intermediate))
+	for i := 0; i < len(intermediate); i++ {
+		newarray[i], err = FromJSON(intermediate[i])
+		if err != nil {
+			return err
+		}
+	}
+	*a = newarray
+	return nil
+}
 
 // String implements [Value]
 func (a Array) String() string {
@@ -275,20 +320,6 @@ func (Bool) xIsValue() {}
 // String implements [Value]
 func (b Bool) String() string {
 	return mustJSONEncodeValue(b)
-}
-
-// Null is an intentionally missing value
-type Null struct{}
-
-func (Null) xIsValue() {}
-
-func (Null) MarshalJSON() ([]byte, error) {
-	return []byte("null"), nil
-}
-
-// String implements [Value]
-func (n Null) String() string {
-	return "null"
 }
 
 // String is an ordered set of UTF-8 characters.
